@@ -1,0 +1,769 @@
+# Copyright 2025 Bryan, B.A., Williams, N., Archibald, C.L., de Haan, F., Wang, J., 
+# van Schoten, N., Hadjikakou, M., Sanson, J.,  Zyngier, R., Marcos-Martinez, R.,  
+# Navarro, J.,  Gao, L., Aghighi, H., Armstrong, T., Bohl, H., Jaffe, P., Khan, M.S., 
+# Moallemi, E.A., Nazari, A., Pan, X., Steyl, D., and Thiruvady, D.R.
+#
+# This file is part of LUTO2 - Version 2 of the Australian Land-Use Trade-Offs model
+#
+# LUTO2 is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# LUTO2 is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# LUTO2. If not, see <https://www.gnu.org/licenses/>.
+
+
+
+"""
+Pure functions to calculate costs of commodities and alt. land uses.
+"""
+
+import itertools
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+
+from luto.data import Data
+import luto.settings as settings
+from luto import tools
+from luto.economics.agricultural.quantity import get_yield_pot, lvs_veg_types, get_quantity, get_exist_renewable_capacity
+from luto.settings import AG_MANAGEMENTS, AG_MANAGEMENTS_TO_LAND_USES
+from functools import lru_cache
+
+
+def get_cost_crop(data:Data, lu, lm, yr_idx):
+    """Return crop production cost <unit: $/cell> of `lu`+`lm` in `yr_idx` as np array.
+
+    Args:
+        data (object/module): Data object or module. Assumes fields like in `luto.data`.
+        lu (str): Land use (e.g., 'Winter cereals' or 'Beef - natural land').
+        lm (str): Land management (e.g., 'dry', 'irr').
+        yr_idx (int): Number of years post base-year ('YR_CAL_BASE').
+
+    Returns
+        pandas.DataFrame: Costs of the crop as a numpy array, with columns representing different cost types.
+
+    Raises:
+        KeyError: If the passed `lm` is neither 'dry' nor 'irr'.
+
+    Notes:
+        - If the land-use does not exist in AGEC_CROPS, zeros are returned.
+
+    """
+    
+    # Check if land-use exists in AGEC_CROPS (e.g., dryland Pears/Rice do not occur), if not return zeros
+    if lu not in data.AGEC_CROPS['AC', lm].columns:
+        costs_t = np.zeros((data.NCELLS))
+        # The column name is irrelevant and only used to make the out df the same shape as the rest of crops.
+        return pd.DataFrame(
+            costs_t,
+            columns=pd.MultiIndex.from_product([[lu], [lm], ['Area cost']])
+        )
+
+    else: # Calculate the total costs 
+        yr_cal = data.YR_CAL_BASE + yr_idx
+        
+        # Quantity costs
+        costs_q = (
+            data.AGEC_CROPS['QC', lm, lu] 
+            * data.QC_COST_MULTS.loc[yr_cal, lu]
+            * get_quantity(data, lu.upper(), lm, yr_idx)
+        )  # lu.upper() only for crops as needs to be in product format in get_quantity().  
+
+        # Area costs.
+        costs_a = data.AGEC_CROPS['AC', lm, lu] * data.AC_COST_MULTS.loc[yr_cal, lu]  # Area costs per hectare.
+
+        # Fixed costs
+        costs_flc = data.AGEC_CROPS['FLC', lm, lu] * data.FLC_COST_MULTS.loc[yr_cal, lu]  # Fixed labour costs.
+        costs_foc = data.AGEC_CROPS['FOC', lm, lu] * data.FOC_COST_MULTS.loc[yr_cal, lu]  # Fixed operating costs.
+        costs_fdc = data.AGEC_CROPS['FDC', lm, lu] * data.FDC_COST_MULTS.loc[yr_cal, lu]  # Fixed depreciation costs.
+
+        # Water costs as water required in ML per hectare x delivery price per ML.
+        if lm == 'irr':
+            costs_w = (
+            data.AGEC_CROPS['WR', lm, lu] 
+            * data.AGEC_CROPS['WP', lm, lu] 
+            * data.WP_COST_MULTS[yr_cal]
+            )
+        elif lm == 'dry':
+            costs_w = 0
+        else: # Passed lm is neither `dry` nor `irr`.
+            raise KeyError(f"Unknown {lm} land management. Check `lm` key.")
+
+        # Convert to $/cell including resfactor.
+        # Quantity costs which has already been adjusted for REAL_AREA/resfactor via get_quantity
+        costs_q *= 1
+        costs_a *= data.REAL_AREA
+        costs_flc *= data.REAL_AREA
+        costs_foc *= data.REAL_AREA
+        costs_fdc *= data.REAL_AREA
+        costs_w *= data.REAL_AREA
+
+        costs_t = np.stack([costs_q, costs_a, costs_flc, costs_foc, costs_fdc, costs_w]).T
+
+        # Return costs as numpy array.
+        return pd.DataFrame(
+            costs_t,
+            columns=pd.MultiIndex.from_product(
+                [
+                    [lu], 
+                    [lm], 
+                    ['Quantity cost', 'Area cost', 'Fixed labour cost', 'Fixed operating cost', 'Fixed depreciation cost', 'Water cost']
+                ]
+            )
+        )
+
+
+
+def get_cost_lvstk(data:Data, lu, lm, yr_idx):
+    """Return lvstk prodution cost <unit: $/cell> of `lu`+`lm` in `yr_idx` as np array.
+
+    Args:
+        data (object/module): Data object or module.
+        lu (str): Land use (e.g. 'Winter cereals' or 'Beef - natural land').
+        lm (str): Land management (e.g. 'dry', 'irr').
+        yr_idx (int): Number of years post base-year ('YR_CAL_BASE').
+
+    Returns
+        pandas.DataFrame: Costs as numpy array, with columns representing different cost types.
+
+    Raises:
+        KeyError: If the passed `lm` is neither 'dry' nor 'irr'.
+
+    """
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Get livestock and vegetation type.
+    lvstype, vegtype = lvs_veg_types(lu)
+    lvstype_capital = lvstype.capitalize()
+
+    # Get the yield potential, i.e. the total number of head per hectare.
+    yield_pot = get_yield_pot(data, lvstype, vegtype, lm, yr_idx)
+
+    # Variable costs - quantity-dependent costs as costs per head x heads per hectare.
+    costs_q = data.AGEC_LVSTK['QC', lvstype] * yield_pot * data.QC_COST_MULTS.loc[yr_cal, lvstype_capital]
+
+    # Variable costs - area-dependent costs per hectare.
+    costs_a = data.AGEC_LVSTK['AC', lvstype] * data.AC_COST_MULTS.loc[yr_cal, lvstype_capital]
+
+    # Fixed costs
+    costs_flc = data.AGEC_LVSTK['FLC', lvstype] * data.FLC_COST_MULTS.loc[yr_cal, lvstype_capital]   # Fixed labour costs.
+    costs_foc = data.AGEC_LVSTK['FOC', lvstype] * data.FOC_COST_MULTS.loc[yr_cal, lvstype_capital]   # Fixed operating costs.
+    costs_fdc = data.AGEC_LVSTK['FDC', lvstype] * data.FDC_COST_MULTS.loc[yr_cal, lvstype_capital]   # Fixed depreciation costs.
+
+    # Water costs in $/ha calculated as water requirements (ML/head) x heads per hectare x delivery price ($/ML)
+    if lm == 'irr': # Irrigation water if required.
+        WR_IRR = data.AGEC_LVSTK['WR_IRR', lvstype]
+    elif lm == 'dry': # No irrigation water if not required.
+        WR_IRR = 0
+    else: # Passed lm is neither `dry` nor `irr`.
+        raise KeyError(f"Unknown {lm} land management. Check `lm` key.")
+
+    # Water delivery costs equal drinking water plus irrigation water req per head * yield (head/ha)
+    costs_w = (data.AGEC_LVSTK['WR_DRN', lvstype] * settings.LIVESTOCK_DRINKING_WATER + WR_IRR) * yield_pot
+    costs_w *= data.WATER_DELIVERY_PRICE * data.WP_COST_MULTS[yr_cal]  # $/ha
+
+    # Convert costs to $ per cell including resfactor.
+    costs_a *= data.REAL_AREA
+    costs_flc *= data.REAL_AREA
+    costs_foc *= data.REAL_AREA
+    costs_fdc *= data.REAL_AREA
+    costs_w *= data.REAL_AREA
+    costs_q *= data.REAL_AREA
+
+    costs = np.stack([costs_a, costs_flc, costs_foc, costs_fdc, costs_w, costs_q]).T
+
+    # Return costs 
+    return pd.DataFrame(
+        costs,
+        columns=pd.MultiIndex.from_product(
+            [
+                [lu], 
+                [lm], 
+                ['Area cost', 'Fixed labour cost', 'Fixed operating cost', 'Fixed depreciation cost', 'Water cost', 'Quantity cost']
+            ]
+        )
+    )
+
+
+def get_cost(data:Data, lu, lm, yr_idx):
+    """
+    Return production cost <unit: $/cell>.
+    Updated to handle Renewable Energy and Unallocated Lands consistently.
+    """
+    
+
+    if lu in data.LU_CROPS:
+        return get_cost_crop(data, lu, lm, yr_idx)
+
+    elif lu in data.LU_LVSTK:
+        return get_cost_lvstk(data, lu, lm, yr_idx)
+
+    elif lu in data.AGRICULTURAL_LANDUSES:
+        return pd.DataFrame(
+            np.zeros(data.NCELLS),
+            columns=pd.MultiIndex.from_product([[lu], [lm], ['Area cost']])
+        )
+
+    else:
+        raise KeyError(f"Land use '{lu}' not found in any LANDUSES")
+
+
+def get_cost_matrix(data:Data, lm, yr_idx):
+    """
+    Return agricultural c_rj matrix <unit: $/cell> per lu under `lm` in `yr_idx`.
+    
+    Parameters
+        data (DataFrame): The input data containing agricultural land use information.
+        lm (str): The land use type.
+        yr_idx (int): The index of the year.
+    
+    Returns
+        DataFrame: The cost matrix representing the costs per cell for each land use under the given land use type and year index.
+    """
+    
+    cost = pd.concat([get_cost(data, lu, lm, yr_idx) for lu in data.AGRICULTURAL_LANDUSES], axis=1)
+        
+    # Make sure all NaNs are replaced by zeroes.
+    return cost.fillna(0)
+
+
+@lru_cache(maxsize=1)
+def get_cost_matrices(data:Data, yr_idx, aggregate=True):
+    """
+    Return agricultural c_mrj matrix <unit: $/cell> as 3D Numpy array.
+
+    Parameters
+    - data: The input data containing information about land management.
+    - yr_idx: The index of the year.
+    - aggregate: A boolean value indicating whether to aggregate the cost matrices or not. Default is True.
+
+    Returns
+    - If aggregate is True, returns a 3D Numpy array representing the aggregated cost matrix.
+    - If aggregate is False, returns a pandas DataFrame representing the cost matrix.
+
+    Raises:
+    - ValueError: If the value of aggregate is neither True nor False.
+    """
+    
+    # Concatenate the revenue from each land management into a single Multiindex DataFrame.
+    cost_rjms = pd.concat([get_cost_matrix(data, lm, yr_idx) for lm in data.LANDMANS], axis=1)
+    
+    if not aggregate:
+        return cost_rjms
+
+    df_jmr = cost_rjms.T.groupby(level=[0, 1]).sum()
+    arr_jmr = df_jmr.values.reshape(*(list(df_jmr.index.levshape) + [-1]))
+    return np.einsum('jmr->mrj', arr_jmr)
+
+
+
+def get_asparagopsis_effect_c_mrj(data:Data, yr_idx):
+    """
+    Applies the effects of using asparagopsis to the cost data
+    for all relevant agricultural land uses.
+
+    Parameters
+    - data: The data object containing relevant information.
+    - yr_idx: The index of the year.
+
+    Returns
+    - new_c_mrj: The updated cost matrix <unit: $/cell>.
+
+    This function calculates the cost per cell for each relevant agricultural land use
+    when using asparagopsis. It takes into account the yield potential, annual cost per
+    animal, and the real area of the cell. The function returns the updated cost matrix.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES["Asparagopsis taxiformis"]
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Set up the effects matrix
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+
+    if not AG_MANAGEMENTS['Asparagopsis taxiformis']:
+        return new_c_mrj
+
+    # Update values in the new matrix
+    for lm in data.LANDMANS:
+        m = 0 if lm == 'dry' else 1
+        for j_idx, lu in enumerate(land_uses):
+            lvstype, vegtype = lvs_veg_types(lu)
+            yield_pot = get_yield_pot(data, lvstype, vegtype, lm, yr_idx)
+            cost_per_animal = data.ASPARAGOPSIS_DATA[lu].loc[yr_cal, 'Annual Cost Per Animal (A$2010/yr)']
+            cost_per_cell = cost_per_animal * yield_pot * data.REAL_AREA
+
+            new_c_mrj[m, :, j_idx] = cost_per_cell
+
+    return new_c_mrj
+
+
+def get_precision_agriculture_effect_c_mrj(data:Data, yr_idx):
+    """
+    Applies the effects of using precision agriculture to the cost data
+    for all relevant agr. land uses.
+
+    Parameters
+    - data: The data object containing the necessary information.
+    - yr_idx: The index of the year to calculate the effects for.
+
+    Returns
+    - new_c_mrj: The updated cost data matrix <unit: $/cell>.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['Precision Agriculture']
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Set up the effects matrix
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+
+    if not AG_MANAGEMENTS['Precision Agriculture']:
+        return new_c_mrj
+
+    for m in range(data.NLMS):
+        for j_idx, lu in enumerate(land_uses):
+            cost_per_ha = data.PRECISION_AGRICULTURE_DATA[settings.LU2TYPE[lu]].loc[yr_cal, 'AnnCost_per_Ha']
+            new_c_mrj[m, :, j_idx] = cost_per_ha * data.REAL_AREA
+
+    return new_c_mrj
+
+
+def get_ecological_grazing_effect_c_mrj(data:Data, yr_idx):
+    """
+    Applies the effects of using ecological grazing to the cost data
+    for all relevant agr. land uses.
+
+    Parameters
+    - data: The data object containing the necessary input data.
+    - yr_idx: The index of the year for which the effects are calculated.
+
+    Returns
+    - new_c_mrj: The matrix containing the updated cost <unit: $/cell>.
+    """
+
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['Ecological Grazing']
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Set up the effects matrix
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+    
+    if not AG_MANAGEMENTS['Ecological Grazing']:
+        return new_c_mrj
+
+    for j_idx, lu in enumerate(land_uses):
+        lvstype, _ = lvs_veg_types(lu)
+
+        # Get effects on operating costs
+        operating_mult = data.ECOLOGICAL_GRAZING_DATA[lu].loc[yr_cal, 'Operating_cost_multiplier']
+        operating_c_effect = data.AGEC_LVSTK['FOC', lvstype] * (operating_mult - 1) * data.REAL_AREA
+
+        # Get effects on labour costs
+        labour_mult = data.ECOLOGICAL_GRAZING_DATA[lu].loc[yr_cal, 'Labour_cost_mulitiplier']
+        labour_c_effect = data.AGEC_LVSTK['FLC', lvstype] * (labour_mult - 1) * data.REAL_AREA
+
+        # Combine for total cost effect
+        total_c_effect = operating_c_effect + labour_c_effect
+
+        for m in range(data.NLMS):
+            new_c_mrj[m, :, j_idx] = total_c_effect
+
+    return new_c_mrj
+
+
+def get_savanna_burning_effect_c_mrj(data:Data, yr_idx: int):
+    """
+    Applies the effects of using LDS Savanna Burning to the cost data
+    for all relevant agr. land uses.
+
+    Parameters
+    - data: The input data containing relevant information for calculations.
+
+    Returns
+    - new_c_mrj: The modified cost data <unit: $/cell>.
+    """
+    nlus = len(AG_MANAGEMENTS_TO_LAND_USES["Savanna Burning"])
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, nlus))
+
+    if not AG_MANAGEMENTS['Savanna Burning']:
+        return new_c_mrj
+
+    sav_burning_effect = (
+        data.SAVBURN_COST_HA
+        * data.SAVBURN_COST_MULTS[data.YR_CAL_BASE + yr_idx]
+        * data.REAL_AREA
+    )
+
+    for m, j in itertools.product(range(data.NLMS), range(nlus)):
+        new_c_mrj[m, :, j] = sav_burning_effect
+
+    return new_c_mrj
+
+
+def get_agtech_ei_effect_c_mrj(data:Data, yr_idx):
+    """
+    Applies the effects of using AgTech EI to the cost data
+    for all relevant agr. land uses.
+
+    Parameters
+    - data: The data object containing the necessary information.
+    - yr_idx: The index of the year.
+
+    Returns
+    - new_c_mrj: The updated cost data <unit: $/cell>.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['AgTech EI']
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Set up the effects matrix
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+
+    if not AG_MANAGEMENTS['AgTech EI']:
+        return new_c_mrj
+
+    for m in range(data.NLMS):
+        for j_idx, lu in enumerate(land_uses):
+            cost_per_ha = data.AGTECH_EI_DATA[settings.LU2TYPE[lu]].loc[yr_cal, 'AnnCost_per_Ha']
+            new_c_mrj[m, :, j_idx] = cost_per_ha * data.REAL_AREA
+
+    return new_c_mrj
+
+
+def get_biochar_effect_c_mrj(data:Data, yr_idx: int):
+    """
+    Applies the effects of using Biochar to the cost data
+    for all relevant agr. land uses.
+
+    Parameters
+    - data: The data object containing the necessary information.
+    - yr_idx: The index of the year.
+
+    Returns
+    - new_c_mrj: The updated cost data <unit: $/cell>.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['Biochar']
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    # Set up the effects matrix
+    new_c_mrj = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+
+    if not AG_MANAGEMENTS['Biochar']:
+        return new_c_mrj
+
+    for m in range(data.NLMS):
+        for j_idx, lu in enumerate(land_uses):
+            cost_per_ha = data.BIOCHAR_DATA[settings.LU2TYPE[lu]].loc[yr_cal, 'AnnCost_per_Ha']
+            new_c_mrj[m, :, j_idx] = cost_per_ha * data.REAL_AREA
+
+    return new_c_mrj
+
+
+def get_beef_hir_effect_c_mrj(data: Data, yr_idx: int):
+    """
+    Applies the effects of using HIR for beef to the cost data
+    for all relevant agr. land uses.
+    
+    Parameters
+    - data: The data object containing the necessary information.
+    - yr_idx: The index of the year.
+    
+    Returns
+    - c_mrj_effects: The updated cost data <unit: $/cell>.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['HIR - Beef']
+    c_mrj_effects = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+
+    # Cost reduction due to reduced livestock density; all costs (Area, Fixed, Quantity ...) are reduced proportionally
+    for m, lm in enumerate(data.LANDMANS):
+        for j_idx, lu in enumerate(land_uses):
+            # ag_cost_r = get_cost_lvstk(data, lu, lm, yr_idx)[(lu, lm, 'Quantity cost')].values
+            ag_cost_r = get_cost_lvstk(data, lu, lm, yr_idx).values.sum(axis=1)  # This is all costs, not just quantity cost
+            c_mrj_effects[m, :, j_idx] += (settings.HIR_PRODUCTIVITY_CONTRIBUTION - 1) * ag_cost_r
+
+    # Maintenance cost per hectare
+    mainten_cost_rj = (settings.BEEF_HIR_MAINTENANCE_COST_PER_HA_PER_YEAR * data.REAL_AREA)[:,None] * (1 - settings.HIR_PRODUCTIVITY_CONTRIBUTION)
+    cost_mrj = c_mrj_effects + mainten_cost_rj
+
+    
+    return cost_mrj
+
+
+def get_sheep_hir_effect_c_mrj(data: Data, yr_idx: int):
+    """
+    Applies the effects of using HIR for sheep to the cost data
+    for all relevant agr. land uses.
+    
+    Parameters
+    - data: The data object containing the necessary information.
+    - yr_idx: The index of the year.
+    
+    Returns
+    - c_mrj_effects: The updated cost data <unit: $/cell>.
+    """
+    land_uses = AG_MANAGEMENTS_TO_LAND_USES['HIR - Sheep']
+    c_mrj_effects = np.zeros((data.NLMS, data.NCELLS, len(land_uses))).astype(np.float32)
+    
+    # Cost reduction due to reduced livestock density; all costs (Area, Fixed, Quantity ...) are reduced proportionally
+    for m, lm in enumerate(data.LANDMANS):
+        for j_idx, lu in enumerate(land_uses):
+            # ag_cost_r = get_cost_lvstk(data, lu, lm, yr_idx)[(lu, lm, 'Quantity cost')].values
+            ag_cost_r = get_cost_lvstk(data, lu, lm, yr_idx).values.sum(axis=1)  # This is all costs, not just quantity cost
+            c_mrj_effects[m, :, j_idx] += (settings.HIR_PRODUCTIVITY_CONTRIBUTION - 1) * ag_cost_r
+
+    # Maintenance cost per hectare
+    mainten_cost_rj = (settings.SHEEP_HIR_MAINTENANCE_COST_PER_HA_PER_YEAR * data.REAL_AREA)[:,None] * (1 - settings.HIR_PRODUCTIVITY_CONTRIBUTION)
+    cost_mrj = c_mrj_effects + mainten_cost_rj
+    
+    return cost_mrj
+
+
+def get_utility_solar_pv_effect_c_mrj(data: Data, c_mrj, yr_idx, aggregate: bool = True):
+    """
+    Applies Utility Solar PV cost effects.
+    Calculates: (Base Ag Cost * Multiplier) + (Solar OPEX + amortised CAPEX)
+
+    Args:
+        aggregate: If True (default), return combined cost array (nlm, ncells, nlu).
+                   If False, return {'opex': ndarray, 'capex': ndarray} with the same shape.
+    """
+
+    land_uses = settings.AG_MANAGEMENTS_TO_LAND_USES['Utility Solar PV']
+    lu_codes = [data.DESC2AGLU[lu] for lu in land_uses]
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    zeros = np.zeros((data.NLMS, data.NCELLS, len(land_uses)), dtype=np.float32)
+
+    if not settings.AG_MANAGEMENTS['Utility Solar PV']:
+        return zeros if aggregate else {'opex': zeros, 'capex': zeros.copy()}
+
+    opex_mrj  = np.zeros_like(zeros)
+    capex_mrj = np.zeros_like(zeros)
+
+    for lu_idx, lu in enumerate(land_uses):
+
+        om_mult = data.RENEWABLE_BUNDLE_SOLAR.query('Year == @yr_cal and Commodity == @lu')['OM_Cost_Multiplier'].item()
+        j = lu_codes[lu_idx]
+        ag_cost_delta = c_mrj[:, :, j] * (om_mult - 1)
+
+        yr_lyr = max(yr_cal, int(data.RENEWABLE_LAYERS['year'].values[0]))
+        re_lyr = data.RENEWABLE_LAYERS.sel(tech_name='Utility Solar PV', year=yr_lyr)
+        re_cost_operation_AUD_ha = (
+            re_lyr['Cost_of_operation_AUD_kw']
+            * 1000                                                  # Convert from AUD/kW to AUD/MW
+            * 0.6944                                                # Adjust AUD from 2024 to 2010
+            * settings.INSTALL_CAPACITY_MW_HA['Utility Solar PV']   # Convert from AUD/MW to AUD/ha
+            * data.REAL_AREA                                        # Convert from AUD/ha to AUD/cell
+        )
+        re_cost_install_AUD_ha = tools.amortise(
+            re_lyr['Cost_of_install_AUD_kw']
+            * 1000                                                  # Convert from AUD/kW to AUD/MW
+            * 0.6944                                                # Adjust AUD from 2024 to 2010
+            * settings.INSTALL_CAPACITY_MW_HA['Utility Solar PV']   # Convert from AUD/MW to AUD/ha
+            * data.REAL_AREA                                        # Convert from AUD/ha to AUD/cell
+        )
+
+        opex_mrj[:, :, lu_idx]  = ag_cost_delta + re_cost_operation_AUD_ha.data[None, :]
+        capex_mrj[:, :, lu_idx] = re_cost_install_AUD_ha.data[None, :]
+
+    if aggregate:
+        return opex_mrj + capex_mrj
+    return {'opex': opex_mrj, 'capex': capex_mrj}
+
+
+
+def get_onshore_wind_effect_c_mrj(data: Data, c_mrj, yr_idx, aggregate: bool = True):
+    """
+    Applies Onshore Wind cost effects.
+    Calculates: (Base Ag Cost * Multiplier) + (Wind OPEX + amortised CAPEX)
+
+    Args:
+        aggregate: If True (default), return combined cost array (nlm, ncells, nlu).
+                   If False, return {'opex': ndarray, 'capex': ndarray} with the same shape.
+    """
+
+    land_uses = settings.AG_MANAGEMENTS_TO_LAND_USES['Onshore Wind']
+    lu_codes = [data.DESC2AGLU[lu] for lu in land_uses]
+    yr_cal = data.YR_CAL_BASE + yr_idx
+
+    zeros = np.zeros((data.NLMS, data.NCELLS, len(land_uses)), dtype=np.float32)
+
+    if not settings.AG_MANAGEMENTS['Onshore Wind']:
+        return zeros if aggregate else {'opex': zeros, 'capex': zeros.copy()}
+
+    opex_mrj  = np.zeros_like(zeros)
+    capex_mrj = np.zeros_like(zeros)
+
+    for lu_idx, lu in enumerate(land_uses):
+
+        om_mult = data.RENEWABLE_BUNDLE_WIND.query('Year == @yr_cal and Commodity == @lu')
+        if om_mult.empty:
+            print(f"Warning: No operationg cost multiplier found for {lu} in year {yr_cal} for Onshore Wind. Using 1.0 as default.")
+            om_mult = 1.0
+        else:
+            om_mult = om_mult['OM_Cost_Multiplier'].item()
+
+        j = lu_codes[lu_idx]
+        ag_cost_delta = c_mrj[:, :, j] * (om_mult - 1)
+
+        yr_lyr = max(yr_cal, int(data.RENEWABLE_LAYERS['year'].values[0]))
+        re_lyr = data.RENEWABLE_LAYERS.sel(tech_name='Onshore Wind', year=yr_lyr)
+        re_cost_operation_AUD_ha = (
+            re_lyr['Cost_of_operation_AUD_kw']
+            * 1000                                                  # Convert from AUD/kW to AUD/MW
+            * 0.6944                                                # Adjust AUD from 2024 to 2010
+            * settings.INSTALL_CAPACITY_MW_HA['Onshore Wind']       # Convert from AUD/MW to AUD/ha
+            * data.REAL_AREA                                        # Convert from AUD/ha to AUD/cell
+        )
+        re_cost_install_AUD_ha = tools.amortise(
+            re_lyr['Cost_of_install_AUD_kw']
+            * 1000                                                  # Convert from AUD/kW to AUD/MW
+            * 0.6944                                                # Adjust AUD from 2024 to 2010
+            * settings.INSTALL_CAPACITY_MW_HA['Onshore Wind']       # Convert from AUD/MW to AUD/ha
+            * data.REAL_AREA                                        # Convert from AUD/ha to AUD/cell
+        )
+
+        opex_mrj[:, :, lu_idx]  = ag_cost_delta + re_cost_operation_AUD_ha.data[None, :]
+        capex_mrj[:, :, lu_idx] = re_cost_install_AUD_ha.data[None, :]
+
+    if aggregate:
+        return opex_mrj + capex_mrj
+    return {'opex': opex_mrj, 'capex': capex_mrj}
+
+
+
+def get_utility_solar_pv_existing_cost_by_region(
+    data: Data, yr_idx: int, aggregate: bool = True, region: str = 'state', return_cells: bool = False
+) -> dict:
+    """
+    Return Utility Solar PV existing cost (OPEX + amortised CAPEX) grouped by region.
+
+    Both OPEX and CAPEX are charged on ALL capacity installed up to and including yr_cal,
+    consistent with the optimised track (dvar_now × cost_mat).
+
+    Args:
+        aggregate: If True (default), return {region: opex + capex}.
+                   If False, return {'opex': {region: opex}, 'capex': {region: capex}}.
+        region: 'state' (default) or 'NRM'.
+        return_cells: If True, return {'opex_r': DataArray[cell], 'capex_r': DataArray[cell]}
+                      before any regional groupby. Overrides aggregate.
+    """
+    if not settings.AG_MANAGEMENTS['Utility Solar PV']:
+        if return_cells:
+            zeros_r = xr.DataArray(np.zeros(data.NCELLS, dtype=np.float32), dims=['cell'])
+            return {'opex_r': zeros_r, 'capex_r': zeros_r}
+        return {} if aggregate else {'opex': {}, 'capex': {}}
+
+    region_names = data.REGION_NRM_NAME if region == 'NRM' else data.REGION_STATE_NAME
+    region_key   = 'nrm'                if region == 'NRM' else 'state'
+
+    yr_cal = data.YR_CAL_BASE + yr_idx
+    re_lyr = data.RENEWABLE_LAYERS.sel(tech_name='Utility Solar PV', year=2030)
+    cap_r  = get_exist_renewable_capacity(data, 'Utility Solar PV', yr_cal)
+
+    opex_r = (
+        cap_r / 8760                                # MWh → MW
+        * 1000                                      # MW → kW
+        * re_lyr['Cost_of_operation_AUD_kw']        # AUD/kW/yr
+    ).assign_coords({region_key: ('cell', region_names)})
+
+    capex_r = (
+        cap_r / 8760                                # MWh → MW
+        * 1000                                      # MW → kW
+        * re_lyr['Cost_of_install_AUD_kw']          # AUD/kW
+    ).assign_coords({region_key: ('cell', region_names)})
+    capex_r.data = tools.amortise(capex_r.data)
+
+    if return_cells:
+        return {'opex_r': opex_r, 'capex_r': capex_r}
+
+    opex_by_region  = opex_r.groupby(region_key).sum('cell').to_dataframe('v').to_dict()['v']
+    capex_by_region = capex_r.groupby(region_key).sum('cell').to_dataframe('v').to_dict()['v']
+
+    if aggregate:
+        return {r: opex_by_region[r] + capex_by_region[r] for r in opex_by_region}
+    return {'opex': opex_by_region, 'capex': capex_by_region}
+
+
+def get_onshore_wind_existing_cost_by_region(
+    data: Data, yr_idx: int, aggregate: bool = True, region: str = 'state', return_cells: bool = False
+) -> dict:
+    """
+    Return Onshore Wind existing cost (OPEX + amortised CAPEX) grouped by region.
+
+    Both OPEX and CAPEX are charged on ALL capacity installed up to and including yr_cal,
+    consistent with the optimised track (dvar_now × cost_mat).
+
+    Args:
+        aggregate: If True (default), return {region: opex + capex}.
+                   If False, return {'opex': {region: opex}, 'capex': {region: capex}}.
+        region: 'state' (default) or 'NRM'.
+    """
+    if not settings.AG_MANAGEMENTS['Onshore Wind']:
+        if return_cells:
+            zeros_r = xr.DataArray(np.zeros(data.NCELLS, dtype=np.float32), dims=['cell'])
+            return {'opex_r': zeros_r, 'capex_r': zeros_r}
+        return {} if aggregate else {'opex': {}, 'capex': {}}
+
+    region_names = data.REGION_NRM_NAME if region == 'NRM' else data.REGION_STATE_NAME
+    region_key   = 'nrm'                if region == 'NRM' else 'state'
+
+    yr_cal = data.YR_CAL_BASE + yr_idx
+    re_lyr = data.RENEWABLE_LAYERS.sel(tech_name='Onshore Wind', year=2030)
+    cap_r  = get_exist_renewable_capacity(data, 'Onshore Wind', yr_cal)
+
+    opex_r = (
+        cap_r / 8760                                # MWh → MW
+        * 1000                                      # MW → kW
+        * re_lyr['Cost_of_operation_AUD_kw']        # AUD/kW/yr
+    ).assign_coords({region_key: ('cell', region_names)})
+
+    capex_r = (
+        cap_r / 8760                                # MWh → MW
+        * 1000                                      # MW → kW
+        * re_lyr['Cost_of_install_AUD_kw']          # AUD/kW
+    ).assign_coords({region_key: ('cell', region_names)})
+    capex_r.data = tools.amortise(capex_r.data)
+
+    if return_cells:
+        return {'opex_r': opex_r, 'capex_r': capex_r}
+
+    opex_by_region  = opex_r.groupby(region_key).sum('cell').to_dataframe('v').to_dict()['v']
+    capex_by_region = capex_r.groupby(region_key).sum('cell').to_dataframe('v').to_dict()['v']
+
+    if aggregate:
+        return {r: opex_by_region[r] + capex_by_region[r] for r in opex_by_region}
+    return {'opex': opex_by_region, 'capex': capex_by_region}
+
+
+def get_agricultural_management_cost_matrices(data: Data, c_mrj, target_year):
+    """
+    Calculate the cost matrices for different agricultural management practices.
+
+    Args:
+        data (dict): The input data for cost calculations.
+        c_mrj (float): The cost of marginal reduction in emissions.
+        target_year (int): The target year for the calculations.
+    Returns
+        dict: A dictionary containing the cost matrices for different agricultural management practices.
+            The keys are the names of the practices and the values are the corresponding cost matrices.
+    """
+
+    yr_idx = target_year - data.YR_CAL_BASE
+    ag_mam_c_mrj = {}
+
+    ag_mam_c_mrj['Asparagopsis taxiformis'] = get_asparagopsis_effect_c_mrj(data, yr_idx)           
+    ag_mam_c_mrj['Precision Agriculture'] = get_precision_agriculture_effect_c_mrj(data, yr_idx)    
+    ag_mam_c_mrj['Ecological Grazing'] = get_ecological_grazing_effect_c_mrj(data, yr_idx)          
+    ag_mam_c_mrj['Savanna Burning'] = get_savanna_burning_effect_c_mrj(data, yr_idx)                
+    ag_mam_c_mrj['AgTech EI'] = get_agtech_ei_effect_c_mrj(data, yr_idx)                            
+    ag_mam_c_mrj['Biochar'] = get_biochar_effect_c_mrj(data, yr_idx)                                
+    ag_mam_c_mrj['HIR - Beef'] = get_beef_hir_effect_c_mrj(data, yr_idx)                            
+    ag_mam_c_mrj['HIR - Sheep'] = get_sheep_hir_effect_c_mrj(data, yr_idx)   
+    ag_mam_c_mrj['Utility Solar PV'] = get_utility_solar_pv_effect_c_mrj(data, c_mrj, yr_idx)
+    ag_mam_c_mrj['Onshore Wind'] = get_onshore_wind_effect_c_mrj(data, c_mrj, yr_idx)
+                        
+
+    return ag_mam_c_mrj
