@@ -1,0 +1,12 @@
+affine
+cf_xarray
+customtkinter
+dask
+joblib
+lz4
+netCDF4
+numpy
+rasterio
+rioxarray
+tkinterdnd2
+xarray

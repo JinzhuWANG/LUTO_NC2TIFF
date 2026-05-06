@@ -1,62 +1,75 @@
 # LUTO NC2TIFF
 
-A standalone helper module for converting [LUTO2](https://github.com/land-use-trade-offs/luto-2.0) simulation outputs from NetCDF format into standard GeoTIFF rasters.
+A desktop GUI for converting [LUTO2](https://github.com/land-use-trade-offs/luto-2.0) NetCDF outputs into GeoTIFF rasters.
 
-If you have received a LUTO output folder, use this tool to extract any spatial layer as a `.tif` file that can be opened in QGIS, ArcGIS, or any other GIS software.
+The tool lets you:
+
+1. choose a `.nc` file,
+2. let the app automatically load the matching cached metadata from `spatial_meta\rf_<N>.lz4`,
+3. inspect the available hierarchical dimensions and items such as `lu`, `lm`, and `am`,
+4. select the item you want from each dimension, and
+5. export the selected layer to a `.tif` file for QGIS, ArcGIS, or other GIS tools.
 
 ## What you need
 
-A LUTO output folder contains two things this tool depends on:
+A LUTO output folder plus this repository's cached metadata folder contain what the tool depends on:
 
 | File | Description |
 | --- | --- |
-| `Data_RES<N>.lz4` | The LUTO data object — holds the geospatial metadata (CRS, transform, mask) needed to reconstruct 2-D rasters |
-| `out_<YYYY>/xr_<variable>_<YYYY>.nc` | NetCDF output files, one per variable per year |
+| `out_<YYYY>\xr_<variable>_<YYYY>.nc` | A NetCDF output file containing the spatial layer values |
+| `spatial_meta\rf_<N>.lz4` | Cached lightweight spatial metadata for each supported RESFACTOR |
 
 ## Installation
 
-```bash
-pip install xarray cf_xarray rioxarray rasterio joblib numpy
-```
-
-## Usage
-
-Open [Get_spatial_layer_from_NC.py](Get_spatial_layer_from_NC.py) and update the three paths:
-
-```python
-import xarray as xr
-import cf_xarray as cfxr
-import joblib
-from helpers import arr_to_xr
-
-# 1. Load the LUTO data object (provides geospatial metadata)
-data = joblib.load("path/to/Data_RES10.lz4")
-
-# 2. Open a NetCDF output file and decode its multi-index dimension
-re_2030 = cfxr.decode_compress_to_multi_index(
-    xr.open_dataset("path/to/out_2030/xr_renewable_energy_2030.nc"), 'layer'
-)['data'].unstack('layer')
-
-# 3. Select the specific layer you want
-#    Dimensions vary by variable — use re_2030.coords to explore available values
-re_2030_solar = re_2030.sel(am='Utility Solar PV', lm='ALL', lu='ALL')
-
-# 4. Reshape the 1-D cell array to a 2-D georeferenced raster
-raster_2d = arr_to_xr(data, re_2030_solar)
-
-# 5. Write to GeoTIFF
-raster_2d.rio.to_raster(
-    "path/to/output/renewable_energy_solar_2030.tif",
-    dtype='float32',
-    compress='LZW'
-)
-```
-
-Then run:
+Run the GUI directly:
 
 ```bash
 python Get_spatial_layer_from_NC.py
 ```
+
+Or on Windows, just double-click:
+
+```text
+LUTO_NC2TIFF_GUI.pyw
+```
+
+To build a zip you can send to other Windows users without asking them to install Python packages:
+
+```text
+build_portable_bundle.bat
+```
+
+On first launch, the script checks for the required Python packages and installs any missing ones automatically with `pip`.
+
+If you prefer to install them yourself first:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+python Get_spatial_layer_from_NC.py
+```
+
+For the most app-like experience on Windows, double-click `LUTO_NC2TIFF_GUI.pyw`.
+
+To create a portable distributable:
+
+1. Double-click `build_portable_bundle.bat`.
+2. Wait for the build to finish.
+3. Send `dist\LUTO_NC2TIFF_GUI.zip`.
+
+The recipient can unzip it and run `LUTO_NC2TIFF_GUI.exe`.
+
+In the GUI:
+
+1. Select a NetCDF file via **Browse…** or drag-and-drop a `.nc` file onto the window.
+2. The app automatically matches the NetCDF `cell` count to the cached metadata in `spatial_meta` and populates the dimension dropdowns.
+3. Choose one value from each available dimension.
+4. Choose the output `.tif` path via **Browse…** (a default path is suggested automatically).
+5. Click **Export to GeoTIFF**.
 
 ## Available variables and units
 
@@ -70,13 +83,6 @@ python Get_spatial_layer_from_NC.py
 | `xr_renewable_energy_<YYYY>.nc` | Renewable energy | MW |
 | `xr_production_<YYYY>.nc` | Productivity | t/ML |
 
-To explore what dimension values (land use, management, etc.) are available for a given file:
-
-```python
-ds = cfxr.decode_compress_to_multi_index(xr.open_dataset("xr_renewable_energy_2030.nc"), 'layer')
-print(ds['data'].unstack('layer').coords)
-```
-
 ## How it works
 
 LUTO stores spatial data as a 1-D array indexed by valid land cells. `arr_to_xr()` in [helpers.py](helpers.py):
@@ -86,4 +92,4 @@ LUTO stores spatial data as a 1-D array indexed by valid land cells. `arr_to_xr(
 3. Sets nodata cells to `NaN`
 4. Attaches the correct CRS and affine transform via `rioxarray`
 
-The returned `xr.DataArray` is immediately ready for `.rio.to_raster()`.
+The GUI opens NetCDF files lazily with Dask-backed chunks, matches the `cell` count to the correct cached spatial metadata file in `spatial_meta`, exposes each hierarchy as a dropdown, and exports the selected 1-D cell layer as a georeferenced GeoTIFF. It does not depend on `luto` at runtime.
